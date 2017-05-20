@@ -1,0 +1,256 @@
+#!/bin/bash
+# ==============================================================================
+# Copyright 2017 Eduardo Valle. All rights reserved.
+# eduardovalle.com/ github.com/recodbr
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+PIGGYBACKING_VERSION=000001
+PIGGYBACKING_URL="https://github.com/recodbr/piggybacking"
+
+# Helper functions
+function echoerr {
+    echo "$@" 1>&2
+}
+
+function echostatus {
+    echo piggyback: "$@" 1>&2
+}
+
+function process_alive {
+    LC_ALL=POSIX ps -o user,pid -p "$1" > /dev/null
+}
+
+function process_children {
+    LC_ALL=POSIX ps -A -o ppid,pid | LC_ALL=POSIX tr "\t" " " | \
+    LC_ALL=POSIX grep '^ *'"$1"' ' | LC_ALL=POSIX sed 's/ *[0-9][0-9]*  *//' | \
+    LC_ALL=POSIX tr -d " "
+}
+
+# Checks command line
+if [ "$1" = "" ]; then
+    echoerr usage: piggyback_launch \<command\> [ arguments... ]
+    echoerr
+    echoerr "WARNINGS: Using this tool grants +x on your home for everyone."
+    echoerr
+    echoerr "          To use with docker / nvidia-docker check documentation"
+    echoerr "          on $PIGGYBACKING_URL"
+    exit 1
+fi
+INTERACTIVE=0
+TERMINATE_CHILDREN_FIRST=0
+KILL_CHILDREN_FIRST=1
+while true; do
+    if [ "$1" = "-i" ]; then
+        INTERACTIVE=1
+        echoerr "WARNING: Launching interactive sessions is an experimental"
+        echoerr "         option that might introduce problems or fail to"
+        echoerr "         kill processes properly. Please check documentation"
+        echoerr "         on $PIGGYBACKING_URL"
+        echoerr
+        shift 1
+    elif [ "$1" = "-i-" ]; then
+        INTERACTIVE=0
+        shift 1
+    elif [ "$1" = "-ct" ]; then
+        TERMINATE_CHILDREN_FIRST=1
+        shift 1
+    elif [ "$1" = "-ct-" ]; then
+        TERMINATE_CHILDREN_FIRST=0
+        shift 1
+    elif [ "$1" = "-ck" ]; then
+        KILL_CHILDREN_FIRST=1
+        shift 1
+    elif [ "$1" = "-ck-" ]; then
+        KILL_CHILDREN_FIRST=0
+        shift 1
+    else :
+        break
+    fi
+done
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echoerr usage: piggyback_launch [ -i ] [ -ct ] [ -ck- ] \<command\> [ arguments for command... ]
+    echoerr
+    echoerr Outputs to stderr the kill code that can be used by other users
+    echoerr to kill the launched process.
+    echoerr
+    echoerr If you need to use pipes or redirections in your command, use
+    echoerr a new shell as your command and the chain of pipes/redirections
+    echoerr as arguments, e.g.:
+    echoerr 'sh -c "command1 | command2 | command3 > output"'
+    echoerr
+    echoerr "WARNINGS: Using this tool grants +x on your home for everyone."
+    echoerr
+    echoerr "          To use with docker / nvidia-docker check documentation"
+    echoerr "          on $PIGGYBACKING_URL"
+    exit 1
+fi
+
+set -u
+set -e
+
+COMMAND="$1"
+shift 1
+
+# Basic configurations
+PIGGYBACKING_DIRECTORY="$HOME/.piggybacking"
+PIGGYBACKING_VERSION=000001
+INTERVAL_TRIGGER_CHECK=10
+INTERVAL_KILL_CHECK=10
+MAX_KILL_CHECKS=3
+TRIGGER_FILE_SECURITY=XXXXXXXXXX #   62^10 combinations > 10^18
+TRIGGER_PASSWORD_SECURITY=10     # x 52^10 combinations > 10^18 (> 10^36)
+# ... maximum number of characters to analyse in trigger file
+#     (this allows about ~3 attempts to get the password right by simply appending)
+MAXIMUM_CHARS_TO_ANALYZE=40
+
+# Traps for termination of this script
+function on_exit {
+    # Kills process if its still alive
+    [ "$COMMAND_PID" != "" ] && kill_immediately
+    # Deletes trigger file if it still exists
+    if [ "$TRIGGER_FILE" != "" ] && [ -f "$TRIGGER_FILE" ]; then
+        rm "$TRIGGER_FILE"
+    fi
+    # Echoes termination status
+    if [ "$RESULT_FILE" != "" ] && [ -f "$RESULT_FILE" ]; then
+        echoerr -n exit:
+        cat "$RESULT_FILE" 1>&2
+        echoerr
+        rm "$RESULT_FILE"
+    fi
+}
+
+function on_control_c {
+    # Tries to interrupt process graciously, if its still alive
+    echo -n " script interrupted with ^C;" >> "$RESULT_FILE"
+    terminate_and_wait
+    # Exits, (if process is still alive, exit trap will kill it)
+    exit 2
+}
+
+# Sets exit trap and creates result status file
+COMMAND_PID=
+TRIGGER_FILE=
+RESULT_FILE=
+trap on_exit EXIT
+
+RESULT_FILE=$(mktemp "$PIGGYBACKING_DIRECTORY/result.$TRIGGER_FILE_SECURITY")
+chmod u+rw-x,go-rwx "$RESULT_FILE"
+echo -n " piggyback_launch interrupted before the process was launched" > "$RESULT_FILE"
+
+# Ensures that everything is ok (folders, permissions, etc.)
+mkdir -p "$PIGGYBACKING_DIRECTORY"
+echo "$PIGGYBACKING_VERSION" > "$PIGGYBACKING_DIRECTORY/version"
+chmod u+rwx,go+r-wx "$PIGGYBACKING_DIRECTORY/version"
+chmod u+rwx,go-rw+x "$PIGGYBACKING_DIRECTORY"
+chmod go+x "$HOME"
+
+# Terminates the running process
+function terminate_and_wait {
+    # If the process is still alive, attempts to terminate it graciously
+    if process_alive "$COMMAND_PID"; then
+        if [ "$TERMINATE_CHILDREN_FIRST" == "1" ]; then
+            for CHILD_PID in $(process_children "$COMMAND_PID"); do
+                kill -s TERM "$CHILD_PID"
+            done
+        fi
+        kill -s TERM "$COMMAND_PID"
+
+        # Waits up to maximum allowable time
+        WAIT=$((MAX_KILL_CHECKS*INTERVAL_KILL_CHECK))
+        echostatus Waiting for process "$COMMAND_PID" termination
+        echostatus "Maximum wait: $((WAIT/60))'$((WAIT%60))''"
+        COUNT=0
+        while process_alive "$COMMAND_PID" && [ "$COUNT" != "$MAX_KILL_CHECKS" ]; do
+            sleep "$INTERVAL_KILL_CHECK"
+            COUNT=$((COUNT+1))
+        done
+
+        if ! process_alive "$COMMAND_PID"; then
+            echo -n " process terminated gracefully;" >> "$RESULT_FILE"
+        fi
+    fi
+}
+
+# Immediate kills the running process
+function kill_immediately {
+    # If the process is still alive, kills it immediately
+    if process_alive "$COMMAND_PID"; then
+        if [ "$KILL_CHILDREN_FIRST" == "1" ]; then
+            for CHILD_PID in $(process_children "$COMMAND_PID"); do
+                kill -s KILL "$CHILD_PID"
+            done
+        fi
+        kill -s KILL "$COMMAND_PID"
+        echo -n " process killed forcefully;"  >> "$RESULT_FILE"
+    fi
+}
+
+# Keeps process alive while trigger file exists and its last line is different from password
+function wait_for_trigger {
+    PASSWORD=
+    while process_alive "$COMMAND_PID" && [ "$PASSWORD" != "$TRIGGER_PASSWORD" ]; do
+        sleep "$INTERVAL_TRIGGER_CHECK"
+        PASSWORD=$(dd if="$TRIGGER_FILE" bs=1 count="$MAXIMUM_CHARS_TO_ANALYZE" 2> /dev/null | tail -n 1)
+        [ ! -f "$TRIGGER_FILE" ] && break
+    done
+
+    terminate_and_wait
+
+    kill_immediately
+
+    if [ "$PASSWORD" != "$TRIGGER_PASSWORD" ]; then
+        echo -n " code not used (process terminated by itself);" >> "$RESULT_FILE"
+    else
+        echo -n " code used;" >> "$RESULT_FILE"
+    fi
+}
+
+# Creates trigger file
+TRIGGER_FILE=$(mktemp "$PIGGYBACKING_DIRECTORY/trigger.$TRIGGER_FILE_SECURITY")
+TRIGGER_CODE=$(basename "$TRIGGER_FILE")
+TRIGGER_CODE=${TRIGGER_CODE#trigger.}
+TRIGGER_PASSWORD=$(</dev/urandom LC_ALL=POSIX tr -dc 'a-zA-Z' | fold -w "$TRIGGER_PASSWORD_SECURITY" | head -n 1)
+chmod u+rw,go+rw-x "$TRIGGER_FILE"
+
+# CODE_SEP = rep(" ", len(TRIGGER_CODE)-len("CODE"))
+CODE_SEP=${#TRIGGER_CODE}
+CODE_SEP=$((CODE_SEP-4))
+CODE_SEP=$(printf %0${CODE_SEP}d 0 | tr 0 " ")
+echostatus The code and password to kill your process are:
+echostatus "    CODE$CODE_SEP PASSWORD"
+echostatus "    $TRIGGER_CODE $TRIGGER_PASSWORD"
+echostatus WARNING: anyone with those codes can kill your process!
+
+# Launches the process and gets PID
+trap on_control_c INT
+
+if [ "$INTERACTIVE" == "1" ]; then
+    "$COMMAND" "$@" <&0 &
+    COMMAND_PID=$!
+else
+    "$COMMAND" "$@" &
+    COMMAND_PID=$!
+fi
+echo "$COMMAND_PID" > "$TRIGGER_FILE"
+echostatus Your process \(pid="$COMMAND_PID"\) has launched
+echo -n > "$RESULT_FILE"
+
+# Launches the trigger waiting loop
+wait_for_trigger &
+
+# Waits until everything is done
+wait

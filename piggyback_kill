@@ -1,0 +1,129 @@
+#!/bin/bash
+# ==============================================================================
+# Copyright 2017 Eduardo Valle. All rights reserved.
+# eduardovalle.com/ github.com/recodbr
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+PIGGYBACKING_VERSION=000001
+PIGGYBACKING_URL="https://github.com/recodbr/piggybacking"
+
+# Helper functions
+function echoerr {
+    echo "$@" 1>&2
+}
+
+function process_alive {
+    LC_ALL=POSIX ps -o user,pid -p "$1" > /dev/null
+}
+
+# Checks command line
+if [ "$3" = "" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echoerr usage: piggyback_kill \<piggybacker\> \<kill code\> \<kill password\>
+    echoerr
+    echoerr See documentation on "$PIGGYBACKING_URL"
+    exit 1
+fi
+
+set -u
+set -e
+
+PIGGYBACKER="$1"
+TRIGGER_CODE="$2"
+TRIGGER_PASSWORD="$3"
+
+# Basic configurations
+INTERVAL_KILL_CHECK=10
+MAX_KILL_CHECKS=33
+MAXIMUM_CHARS_TO_ANALYZE=40
+PIGGYBACKING_SUBDIRECTORY=.piggybacking
+PIGGYBACKING_DIRECTORY="$HOME/../$PIGGYBACKER/$PIGGYBACKING_SUBDIRECTORY"
+
+# Checks that everything is ok (user, folders, permissions, etc.)
+if [ "$PIGGYBACKER" == "$USER" ]; then
+    echoerr You cannot use piggyback_kill to kill your own processes
+    echoerr Use kill -s TERM \<pid\> or kill -s KILL \<pid\>
+    exit 2
+fi
+
+if [ ! -d "$PIGGYBACKING_DIRECTORY" ]; then
+    # shellcheck disable=SC2088
+    echoerr Missing '~/'$PIGGYBACKING_SUBDIRECTORY directory for user "$PIGGYBACKER"
+    exit 2
+fi
+
+VERSION_FILE="$HOME/../$PIGGYBACKER/$PIGGYBACKING_SUBDIRECTORY/version"
+if [ ! -f "$VERSION_FILE" ]; then
+    # shellcheck disable=SC2088
+    echoerr Missing version file '~/'$PIGGYBACKING_SUBDIRECTORY/version for user "$PIGGYBACKER"
+    exit 2
+fi
+
+PIGGYBACKER_VERSION=$(dd if="$VERSION_FILE" bs=1 count=${#PIGGYBACKING_VERSION} 2> /dev/null | tr -dc '0-9')
+if [ "$PIGGYBACKER_VERSION" == "" ]; then
+    # shellcheck disable=SC2088
+    echoerr Invalid version file '~/'$PIGGYBACKING_SUBDIRECTORY/version for user "$PIGGYBACKER"
+    exit 2
+fi
+
+if [ "$PIGGYBACKER_VERSION" -gt "$PIGGYBACKING_VERSION" ]; then
+    echoerr User "$PIGGYBACKER" is using a more recent version of Piggybacking \(v."$PIGGYBACKER_VERSION"\)
+    echoerr than you are \(v. "$PIGGYBACKING_VERSION"\). Please download the latest version from
+    echoerr "$PIGGYBACKING_URL"
+    exit 2
+fi
+
+TRIGGER_FILE="$HOME/../$PIGGYBACKER/$PIGGYBACKING_SUBDIRECTORY/trigger.$TRIGGER_CODE"
+if [ ! -f "$TRIGGER_FILE" ]; then
+    echoerr Kill file not found: "$TRIGGER_FILE"
+    echoerr That means that the process already finished,
+    echoerr or that kill code "$TRIGGER_CODE" is invalid
+    exit 3
+fi
+
+# Appends password to password (this allows a limited number of attempts)
+echo "$TRIGGER_PASSWORD" >> "$TRIGGER_FILE"
+
+# Gets process id
+COMMAND_PID=$(dd if="$TRIGGER_FILE" bs=1 count="$MAXIMUM_CHARS_TO_ANALYZE" 2> /dev/null | head -n 1 | tr -dc '0-9')
+
+if [ "$COMMAND_PID" == "" ]; then
+    echoerr Kill file does not contain a process id: "$TRIGGER_FILE"
+    exit 3
+fi
+
+# Waits until process dies
+# Waits up to maximum allowable time
+if process_alive "$COMMAND_PID"; then
+    echo Waiting for process "$COMMAND_PID" termination
+fi
+WAIT=$((MAX_KILL_CHECKS*INTERVAL_KILL_CHECK))
+COUNT=0
+while process_alive "$COMMAND_PID" && [ "$COUNT" != "$MAX_KILL_CHECKS" ]; do
+    echo -ne "Maximum wait: $((WAIT/60))'$((WAIT%60))''          \r"
+    sleep "$INTERVAL_KILL_CHECK"
+    WAIT=$((WAIT-INTERVAL_KILL_CHECK))
+    COUNT=$((COUNT+1))
+done
+echo "                         "
+
+# If process is still alive, notifies user
+if process_alive "$COMMAND_PID"; then
+    echoerr Process refused termination. Please ensure you entered the right
+    echoerr password \(you have only about 3 attempts\). If the password is
+    echoerr right, please contact user "$PIGGYBACKER"
+    exit 4
+else
+    echoerr Process terminated.
+fi
